@@ -1,0 +1,7 @@
+{
+  "org": "your-github-org",
+  "review_team": "your-team-slug",
+  "clones": ["~/repos"],
+  "setup": { "example-repo": "npm ci" },
+  "review_command": "/code-review:code-review"
+}

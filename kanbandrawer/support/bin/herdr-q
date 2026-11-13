@@ -1,0 +1,126 @@
+#!/bin/sh
+# herdr-q: queue a GitHub issue as a Herdr worktree with a board card.
+#
+#   herdr-q <repo> <issue> [--park] [--type fix|feat|chore|docs|refactor] [--slug words] [--yes]
+#
+# Without --yes it prints the plan and changes nothing. With --yes it:
+#   1. stops if someone else is assigned, else assigns the issue to you
+#   2. fetches and adds a worktree at ~/.herdr/worktrees/<repo>/<type>-<n>-<slug>
+#      on branch <type>/<n>-<slug>, from origin's default branch, with no upstream
+#      (so the first `git push -u origin HEAD` creates the branch under its own name)
+#   3. runs the repo's setup command (config.json "setup", by repo name)
+#   4. adds the board card (planning, or claimed with --park)
+#   5. opens a Herdr space there; without --park its first tab is Claude with the
+#      orient-and-plan prompt as its first message
+#
+# Confirming the repo and issue with the person is the caller's job.
+
+set -eu
+
+die() { printf 'herdr-q: %s\n' "$*" >&2; exit 1; }
+
+[ $# -ge 2 ] || die "usage: herdr-q <repo> <issue> [--park] [--type T] [--slug words] [--yes]"
+REPO=$1; ISSUE=$2; shift 2
+PARK=0; TYPE=""; SLUG=""; YES=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --park) PARK=1 ;;
+    --type) TYPE=$2; shift ;;
+    --slug) SLUG=$2; shift ;;
+    --yes) YES=1 ;;
+    *) die "unknown option $1" ;;
+  esac
+  shift
+done
+
+command -v jq >/dev/null || die "jq is required"
+CONFIG="${HERDR_BOARD_CONFIG:-$HOME/.claude/herdr/config.json}"
+cfg() { jq -r "$1 // empty" "$CONFIG" 2>/dev/null || true; }
+# Folders holding your clones, from config.json "clones" (default ~/repos).
+clone_dirs() {
+  dirs=$(jq -r '.clones[]? // empty' "$CONFIG" 2>/dev/null || true)
+  [ -n "$dirs" ] || dirs="~/repos"
+  printf '%s\n' "$dirs" | sed "s|^~|$HOME|"
+}
+find_clone() { # find_clone <owner/repo>: the first clone whose origin is that repo
+  name=${1#*/}
+  for d in $(clone_dirs); do
+    if [ -e "$d/$name/.git" ] && git -C "$d/$name" remote get-url origin 2>/dev/null | grep -qi "[:/]$1\(\.git\)\{0,1\}$"; then echo "$d/$name"; return 0; fi
+  done
+  return 1
+}
+ORG=$(cfg .org)
+case $REPO in */*) ORG=${REPO%%/*}; REPO=${REPO#*/} ;; esac
+[ -n "$ORG" ] || die "give owner/repo, or set \"org\" in $CONFIG"
+SRC=$(find_clone "$ORG/$REPO") || die "no clone of $ORG/$REPO in: $(clone_dirs | tr '\n' ' ')"
+BOARD="$HOME/.claude/herdr/bin/herdr-board"
+
+info=$(gh issue view "$ISSUE" --repo "$ORG/$REPO" --json title,state,assignees,labels) || die "cannot read $ORG/$REPO#$ISSUE"
+title=$(printf '%s' "$info" | jq -r .title)
+state=$(printf '%s' "$info" | jq -r .state)
+labels=$(printf '%s' "$info" | jq -r '[.labels[].name] | join(",")')
+me=$(gh api user --jq .login)
+others=$(printf '%s' "$info" | jq -r --arg me "$me" '[.assignees[].login | select(. != $me)] | join(", ")')
+
+[ "$state" = OPEN ] || die "#$ISSUE is $state"
+[ -z "$others" ] || die "#$ISSUE is assigned to $others; ask before queuing it"
+
+if [ -z "$TYPE" ]; then
+  case ",$labels," in
+    *,bug,*) TYPE=fix ;;
+    *,documentation,*|*,docs,*) TYPE=docs ;;
+    *,refactor,*) TYPE=refactor ;;
+    *,chore,*|*,dependencies,*) TYPE=chore ;;
+    *) TYPE=feat ;;
+  esac
+fi
+[ -n "$SLUG" ] || SLUG=$title
+SLUG=$(printf '%s' "$SLUG" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -d- -f1-5)
+BRANCH="$TYPE/$ISSUE-$SLUG"
+DIR="$HOME/.herdr/worktrees/$REPO/$TYPE-$ISSUE-$SLUG"
+
+base=$(git -C "$SRC" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)
+
+setup=$(jq -r --arg r "$REPO" '.setup[$r] // empty' "$CONFIG" 2>/dev/null || true)
+
+PROMPT="You are picking up $REPO issue #$ISSUE in this worktree (branch $BRANCH). Read the issue with \`gh issue view $ISSUE --repo $ORG/$REPO --comments\`; decisions may be in the comments. Verify its claims against the code before you plan around them, and check the work is not already done (look for merged PRs). Read CLAUDE.md if present. Then write a plan. Do not edit code, commit, or open a PR until the plan is approved."
+
+cat <<EOF
+Issue:   $ORG/$REPO#$ISSUE  $title
+Labels:  ${labels:-none}
+Branch:  $BRANCH  (from $base, no upstream)
+Path:    $DIR
+Setup:   ${setup:-none}
+Card:    $( [ $PARK = 1 ] && echo "claimed (TODO), no session" || echo "planning, Claude session started" )
+EOF
+
+[ $YES = 1 ] || { echo; echo "Dry run. Re-run with --yes to queue it."; exit 0; }
+
+[ ! -e "$DIR" ] || die "$DIR already exists"
+git -C "$SRC" show-ref --verify --quiet "refs/heads/$BRANCH" && die "branch $BRANCH already exists in $SRC"
+
+gh issue edit "$ISSUE" --repo "$ORG/$REPO" --add-assignee @me >/dev/null
+git -C "$SRC" fetch --quiet origin
+mkdir -p "$(dirname "$DIR")"
+git -C "$SRC" worktree add --quiet --no-track -b "$BRANCH" "$DIR" "$base"
+[ "$(git -C "$DIR" rev-parse HEAD)" = "$(git -C "$SRC" rev-parse "$base")" ] || die "worktree HEAD does not match $base"
+
+if [ -n "$setup" ]; then
+  echo "Running setup: $setup"
+  (cd "$DIR" && sh -c "$setup") || echo "herdr-q: setup failed; the worktree is ready, run it by hand" >&2
+fi
+
+stage=planning; [ $PARK = 1 ] && stage=claimed
+"$BOARD" add --path "$DIR" --repo "$ORG/$REPO" --issue "$ISSUE" --branch "$BRANCH" --title "$title" --stage "$stage" >/dev/null
+
+name="$REPO #$ISSUE"
+if [ $PARK = 1 ]; then
+  args=$(jq -nc --arg n "$name" --arg f "$DIR" '{name:$n, folder:$f}')
+else
+  args=$(jq -nc --arg n "$name" --arg f "$DIR" --arg t "$PROMPT" '{name:$n, folder:$f, argv:["claude"], task:$t}')
+fi
+# The kanbandrawer layout shows the issue in the space's stage column, so it gets no tab of its own.
+herdr-app do space.new "$args" >/dev/null \
+  || echo "herdr-q: could not open a Herdr space (is Herdr running?); the card and worktree exist" >&2
+
+echo "Queued $ORG/$REPO#$ISSUE → $stage"

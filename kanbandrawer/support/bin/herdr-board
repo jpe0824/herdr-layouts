@@ -1,0 +1,1344 @@
+#!/usr/bin/env -S python3 -I
+"""herdr-board: the Herdr board's store and the only thing that writes it.
+
+One card per git worktree, keyed by the worktree's absolute path. The sidebar mod,
+the Claude Code hook and herdr-q all read and write through this, so
+writes never interleave: each one takes a lock directory and replaces the file
+atomically.
+
+Standard library only. The store defaults to ~/.claude/herdr/board.json;
+HERDR_BOARD_FILE overrides it (tests use a scratch file).
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+STAGES = ["claimed", "planning", "in_progress", "pending", "in_review", "done"]
+STORE = Path(os.environ.get("HERDR_BOARD_FILE", Path.home() / ".claude/herdr/board.json"))
+CONFIG = Path(os.environ.get("HERDR_BOARD_CONFIG", Path.home() / ".claude/herdr/config.json"))
+
+
+def config():
+    """~/.claude/herdr/config.json: {"org": "...", "review_team": "..."}. Missing is fine."""
+    try:
+        return json.loads(CONFIG.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+LOCK = STORE.with_suffix(".lock")
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def today():
+    return dt.date.today()
+
+
+# ---------- store ----------
+
+class Locked:
+    """A lock directory. A lock older than 15 s belongs to a crashed writer."""
+
+    def __enter__(self):
+        STORE.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.time() + 10
+        while True:
+            try:
+                LOCK.mkdir()
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - LOCK.stat().st_mtime > 15:
+                        LOCK.rmdir()
+                        continue
+                except FileNotFoundError:
+                    continue
+                if time.time() > deadline:
+                    raise SystemExit("herdr-board: store is locked by another writer")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            LOCK.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def load():
+    try:
+        data = json.loads(STORE.read_text())
+    except FileNotFoundError:
+        return {"version": 1, "cards": {}}
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"herdr-board: {STORE} is not valid JSON ({e}); fix or move it aside")
+    data.setdefault("cards", {})
+    return data
+
+
+def save(data):
+    fd, tmp = tempfile.mkstemp(dir=STORE.parent, prefix=".board-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, STORE)
+    push_moved()
+
+
+def push_moved():
+    """Starts one detached `push-status` per moved card, so a hook or sync never waits
+    on GitHub. HERDR_BOARD_PUSH=off disables it; =inline runs it in this process (tests)."""
+    mode = os.environ.get("HERDR_BOARD_PUSH", "async")
+    paths = sorted(MOVED)
+    MOVED.clear()
+    if mode == "off":
+        return
+    for path in paths:
+        if mode == "inline":
+            push_status(path)
+            continue
+        try:
+            with open(PUSH_LOG, "a") as log:
+                subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "push-status", path],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        except OSError:
+            pass
+
+
+def resolve(cards, given):
+    """The card a path belongs to: the given path, or the cwd's, inside a card's worktree."""
+    target = os.path.realpath(given or os.getcwd())
+    best = None
+    for key in cards:
+        k = os.path.realpath(key)
+        if target == k or target.startswith(k + os.sep):
+            if best is None or len(k) > len(best):
+                best = key
+    return best
+
+
+def require(cards, given):
+    key = resolve(cards, given)
+    if not key:
+        raise SystemExit(f"herdr-board: no card for {given or os.getcwd()}")
+    return key
+
+
+# Cards that changed stage in this process; save() pushes their status to GitHub.
+MOVED = set()
+
+
+def move(card, stage, why):
+    if card.get("stage") == stage:
+        return False
+    if card.get("path") and card.get("issue") and card.get("repo") and not card.get("parent"):
+        MOVED.add(card["path"])
+    card["stage"] = stage
+    card["stage_changed"] = now_iso()
+    card["updated"] = card["stage_changed"]
+    card["last_move"] = why
+    return True
+
+
+# ---------- families ----------
+#
+# A session sometimes does part of its issue's work in another repo's worktree. That
+# worktree gets a child card (`parent` = the session's card path): it carries its own
+# repo, branch and PR so sync reads the right repo, but it has no stage of its own. Its
+# stage mirrors the parent's, and every move goes through the parent.
+
+def children(cards, key):
+    return [k for k, c in cards.items() if c.get("parent") == key]
+
+
+def head_of(cards, key):
+    """The card that owns a family's stage: a child's parent, else the card itself."""
+    parent = cards.get(key, {}).get("parent")
+    return parent if parent in cards else key
+
+
+def move_family(cards, key, stage, why):
+    changed = move(cards[key], stage, why)
+    for k in children(cards, key):
+        changed = move(cards[k], stage, f"parent: {why}") or changed
+    return changed
+
+
+def mirror_children(cards):
+    """Brings every child to its parent's stage. Returns True if any card changed."""
+    changed = False
+    for c in cards.values():
+        parent = cards.get(c.get("parent") or "")
+        if parent and c.get("stage") != parent.get("stage"):
+            changed = move(c, parent["stage"], f"parent: {parent.get('last_move', 'moved')}") or changed
+    return changed
+
+
+def parse_date(s):
+    s = s.strip()
+    m = re.fullmatch(r"\+(\d+)([dw])", s)
+    if m:
+        n = int(m.group(1)) * (7 if m.group(2) == "w" else 1)
+        return (today() + dt.timedelta(days=n)).isoformat()
+    try:
+        return dt.date.fromisoformat(s).isoformat()
+    except ValueError:
+        raise SystemExit(f"herdr-board: date must be YYYY-MM-DD or +Nd / +Nw, got {s!r}")
+
+
+# ---------- commands ----------
+
+def cmd_add(a):
+    path = os.path.realpath(a.path or os.getcwd())
+    if a.stage not in STAGES:
+        raise SystemExit(f"herdr-board: stage must be one of {', '.join(STAGES)}")
+    parent = os.path.realpath(a.parent) if a.parent else None
+    with Locked():
+        data = load()
+        if parent:
+            parent = head_of(data["cards"], resolve(data["cards"], parent) or "")
+            if parent not in data["cards"] or parent == path:
+                raise SystemExit(f"herdr-board: no parent card for {a.parent}")
+        card = data["cards"].get(path, {"created": now_iso()})
+        card.update({k: v for k, v in {
+            "path": path, "repo": a.repo, "issue": a.issue, "branch": a.branch, "title": a.title,
+            "parent": parent,
+        }.items() if v is not None})
+        move(card, data["cards"][parent]["stage"] if parent else a.stage, "attached" if parent else "added")
+        data["cards"][path] = card
+        save(data)
+    print(json.dumps(card, indent=2))
+
+
+def cmd_set(a):
+    if a.stage not in STAGES:
+        raise SystemExit(f"herdr-board: stage must be one of {', '.join(STAGES)}")
+    with Locked():
+        data = load()
+        key = head_of(data["cards"], require(data["cards"], a.path))
+        card = data["cards"][key]
+        if a.stage == "pending":
+            raise SystemExit("herdr-board: use `herdr-board pending --for ... --until ...` for Pending")
+        card.pop("pending", None)
+        if move_family(data["cards"], key, a.stage, a.why or "set"):
+            save(data)
+    print(f"{key}: {a.stage}")
+
+
+def cmd_pending(a):
+    until = parse_date(a.until)
+    with Locked():
+        data = load()
+        key = head_of(data["cards"], require(data["cards"], a.path))
+        card = data["cards"][key]
+        card["pending"] = {"for": a.reason, "until": until, "from": card.get("stage") if card.get("stage") != "pending" else card.get("pending", {}).get("from")}
+        move_family(data["cards"], key, "pending", "pending")
+        card["updated"] = now_iso()
+        save(data)
+    print(f"{key}: pending until {until} ({a.reason})")
+
+
+def cmd_snooze(a):
+    until = parse_date(a.until)
+    with Locked():
+        data = load()
+        key = head_of(data["cards"], require(data["cards"], a.path))
+        card = data["cards"][key]
+        if card.get("stage") != "pending":
+            raise SystemExit("herdr-board: only a Pending card can be snoozed")
+        card["pending"]["until"] = until
+        card["updated"] = now_iso()
+        save(data)
+    print(f"{key}: snoozed until {until}")
+
+
+def cmd_resume(a):
+    with Locked():
+        data = load()
+        key = head_of(data["cards"], require(data["cards"], a.path))
+        card = data["cards"][key]
+        if card.get("stage") != "pending":
+            raise SystemExit("herdr-board: card is not Pending")
+        card.pop("pending", None)
+        move_family(data["cards"], key, "in_progress", "resumed")
+        save(data)
+    print(f"{key}: in_progress")
+
+
+def cmd_pr(a):
+    m = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", a.url)
+    if not m:
+        raise SystemExit("herdr-board: expected a GitHub PR URL")
+    with Locked():
+        data = load()
+        key = require(data["cards"], a.path)
+        card = data["cards"][key]
+        add_pr(card, {"url": a.url, "number": int(m.group(2))})
+        card.setdefault("repo", m.group(1))
+        card["updated"] = now_iso()
+        save(data)
+    print(f"{key}: PR #{m.group(2)}")
+
+
+def cmd_rm(a):
+    with Locked():
+        data = load()
+        key = require(data["cards"], a.path)
+        del data["cards"][key]
+        # Children outlive a removed parent as cards of their own, so a worktree still
+        # on disk never drops off the board.
+        orphans = children(data["cards"], key)
+        for k in orphans:
+            data["cards"][k].pop("parent", None)
+            data["cards"][k]["updated"] = now_iso()
+        save(data)
+    print(f"removed card {key} (the checkout is untouched)")
+    for k in orphans:
+        print(f"  {k} is now a card of its own")
+
+
+def cmd_list(a):
+    data = load()
+    if a.json:
+        print(json.dumps(data, indent=2))
+        return
+    cards = data["cards"]
+    top = [k for k, c in cards.items() if c.get("parent") not in cards]
+    for key in sorted(top, key=lambda k: STAGES.index(cards[k].get("stage", "claimed"))):
+        c = cards[key]
+        extra = ""
+        if c.get("stage") == "pending":
+            extra = f"  until {c['pending']['until']}: {c['pending']['for']}"
+        elif c.get("pr", {}).get("number"):
+            extra = f"  PR #{c['pr']['number']} {c['pr'].get('state', '')}".rstrip()
+        print(f"{c.get('stage', '?'):12} {c.get('repo', '?')}#{c.get('issue', '?')}  {c.get('title') or c.get('branch', '')}{extra}")
+        for k in children(cards, key):
+            ch = cards[k]
+            pr = f"  PR #{ch['pr']['number']} {ch['pr'].get('state', '')}".rstrip() if ch.get("pr", {}).get("number") else ""
+            print(f"{'':12}   ↳ {ch.get('repo', '?')}  {ch.get('branch', '')}{pr}")
+
+
+def cmd_show(a):
+    data = load()
+    key = require(data["cards"], a.path)
+    print(json.dumps(data["cards"][key], indent=2))
+
+
+# ---------- GitHub sync ----------
+
+def gh(args, timeout=30):
+    r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"gh {' '.join(args)} failed")
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+FAIL = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+RUNNING = {"IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "REQUESTED", "EXPECTED"}
+
+
+def latest_checks(rollup):
+    """GitHub lists every run of a check; keep only the latest run of each one, so a
+    re-run that passed (after adding a label, say) replaces the old failures."""
+    best = {}
+    for c in rollup or []:
+        key = (c.get("workflowName") or "", c.get("name") or c.get("context") or "")
+        at = c.get("startedAt") or c.get("completedAt") or c.get("createdAt") or ""
+        if key not in best or at >= best[key][0]:
+            best[key] = (at, c)
+    return [c for _, c in best.values()]
+
+
+def ci_summary(rollup):
+    rollup = latest_checks(rollup)
+    if not rollup:
+        return None
+    total, failing, running = len(rollup), 0, 0
+    for c in rollup:
+        word = (c.get("conclusion") or c.get("state") or "").upper()
+        status = (c.get("status") or "").upper()
+        if word in FAIL:
+            failing += 1
+        elif status in RUNNING or word in RUNNING or (not word and status != "COMPLETED"):
+            running += 1
+    state = "fail" if failing else "run" if running else "pass"
+    return {"state": state, "total": total, "failing": failing, "running": running}
+
+
+PR_FIELDS = "number,url,state,isDraft,mergedAt,reviewDecision,statusCheckRollup,headRefName,mergeCommit,baseRefName"
+
+
+SETTLED = ("MERGED", "CLOSED")
+
+
+def prs_of(card):
+    """Every PR a card's worktree has opened, oldest first. A card written before `prs`
+    existed holds only `pr`."""
+    if card.get("prs"):
+        return card["prs"]
+    return [card["pr"]] if card.get("pr", {}).get("number") else []
+
+
+def add_pr(card, pr):
+    """Adds or updates one PR by number. `pr` stays the one to show first: the newest
+    open PR, else the newest."""
+    prs = [dict(p) for p in prs_of(card)]
+    for p in prs:
+        if p.get("number") == pr.get("number"):
+            p.update({k: v for k, v in pr.items() if v is not None})
+            break
+    else:
+        prs.append(dict(pr))
+    prs.sort(key=lambda p: p.get("number") or 0)
+    live = [p for p in prs if p.get("state") not in SETTLED]
+    card["prs"], card["pr"] = prs, dict((live or prs)[-1])
+
+
+def pr_record(pr):
+    return {
+        "number": pr["number"], "url": pr["url"], "state": "MERGED" if pr.get("mergedAt") else pr["state"],
+        "draft": pr.get("isDraft", False), "review_decision": pr.get("reviewDecision") or None,
+        "ci": ci_summary(pr.get("statusCheckRollup")), "branch": pr.get("headRefName"), "checked": now_iso(),
+        "merge_sha": (pr.get("mergeCommit") or {}).get("oid"), "base": pr.get("baseRefName"),
+        "merged_at": pr.get("mergedAt"),
+    }
+
+
+def find_prs(card):
+    """GitHub's view of the card's unsettled PRs, plus any new PR from its current branch.
+    A worktree can open several: a session may switch branches after a merge."""
+    repo, known = card["repo"], prs_of(card)
+    out = [gh(["pr", "view", str(p["number"]), "--repo", repo, "--json", PR_FIELDS])
+           for p in known if p.get("state") not in SETTLED]
+    if card.get("branch"):
+        numbers = {p["number"] for p in known}
+        listed = gh(["pr", "list", "--repo", repo, "--head", card["branch"], "--state", "all", "--limit", "5", "--json", PR_FIELDS])
+        out += [p for p in listed or [] if p["number"] not in numbers]
+    return [p for p in out if p]
+
+
+def sync_card(card, kids_open=False):
+    """Reads GitHub for one card and returns (move reason or None, error or None).
+
+    Moves happen on GitHub transitions only, so the hook and the poll never fight:
+    a card a session moved back to In progress stays there until GitHub changes.
+    A card is Done only when nothing in its family is still open: its own PRs and, via
+    kids_open, its children's."""
+    stage = card.get("stage")
+    child = bool(card.get("parent"))
+    if not card.get("repo"):
+        return None, None
+    settled = all(p.get("state") in SETTLED for p in prs_of(card))
+    if not child and stage in ("pending", "done"):
+        return None, None
+    wt = git_worktree(card["path"]) if card.get("path") else None
+    # A child's stage follows its parent, so only its PRs are read. They are read while
+    # the parent is Pending too, and stop once the family is Done and they are settled,
+    # unless the worktree has moved to a new branch, which may carry a new PR.
+    if child and stage == "done" and settled and not (wt and wt[2] != card.get("branch")):
+        return None, None
+    if wt and wt[2] != card.get("branch"):
+        card["branch"] = wt[2]
+    old = {p["number"]: p for p in prs_of(card)}
+    try:
+        fresh = find_prs(card)
+    except Exception as e:  # noqa: BLE001 - reported, never fatal
+        return None, str(e)
+    for pr in fresh:
+        add_pr(card, pr_record(pr))
+    if child:
+        return None, None
+    prs = prs_of(card)
+    if prs:
+        became = lambda p, key, v: p.get(key) == v and old.get(p["number"], {}).get(key) != v  # noqa: E731
+        open_ = [p for p in prs if p.get("state") not in SETTLED]
+        if not open_:
+            if kids_open:
+                return None, None  # its own work merged; an attached repo's PR is still open
+            if any(p.get("state") == "MERGED" for p in prs):
+                return ("PR merged" if move(card, "done", "PR merged") else None), None
+            if any(became(p, "state", "CLOSED") for p in prs):
+                return ("PR closed unmerged" if move(card, "in_progress", "PR closed unmerged") else None), None
+            return None, None
+        if any(became(p, "review_decision", "CHANGES_REQUESTED") for p in open_):
+            return ("changes requested" if move(card, "in_progress", "changes requested") else None), None
+        if stage in ("claimed", "planning") and any(not p.get("draft") for p in open_):
+            return ("PR opened" if move(card, "in_review", "PR opened") else None), None
+        return None, None
+    if card.get("issue") and not kids_open:
+        try:
+            issue = gh(["issue", "view", str(card["issue"]), "--repo", card["repo"], "--json", "state"])
+        except Exception as e:  # noqa: BLE001
+            return None, str(e)
+        if issue and issue.get("state") == "CLOSED":
+            return ("issue closed" if move(card, "done", "issue closed") else None), None
+    return None, None
+
+
+def aggregate_runs(runs):
+    """One state for the push runs on a merge commit."""
+    if any(r.get("status") != "completed" for r in runs):
+        return "running"
+    if any(r.get("conclusion") in MERGE_CI_FAIL for r in runs):
+        return "failure"
+    return "success" if runs else "none"
+
+
+MERGE_CI_FAIL = ("failure", "cancelled", "timed_out", "startup_failure")
+MERGE_CI_NONE_WINDOW = 30 * 60  # seconds after mergedAt during which "no runs yet" is re-checked
+
+
+def merge_ci_due(pr):
+    """A merged PR is re-checked until its runs settle; "none" gives up 30 minutes after the merge."""
+    if pr.get("state") != "MERGED" or not pr.get("merge_sha") or not pr.get("base"):
+        return False
+    state = (pr.get("merge_ci") or {}).get("state")
+    if state in ("success", "failure"):
+        return False
+    if state == "none":
+        try:
+            merged = dt.datetime.fromisoformat((pr.get("merged_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return (dt.datetime.now(dt.timezone.utc) - merged).total_seconds() <= MERGE_CI_NONE_WINDOW
+    return True
+
+
+def merge_ci_pass(cards, errors=None):
+    """{path: {pr number: merge_ci}} for the merged PRs whose post-merge runs are unsettled.
+    A failed lookup leaves that PR out, so its stored value stays; the failure goes to `errors`."""
+    out = {}
+    for path, card in cards.items():
+        if not card.get("repo"):
+            continue
+        for pr in prs_of(card):
+            if not merge_ci_due(pr):
+                continue
+            try:
+                found = gh(["run", "list", "--repo", card["repo"], "--commit", pr["merge_sha"], "--branch", pr["base"],
+                            "--event", "push", "--json", "workflowName,url,status,conclusion", "--limit", "20"]) or []
+            except Exception as e:  # noqa: BLE001 - reported, never fatal
+                if errors is not None:
+                    errors.append({"path": path, "error": f"merge CI for #{pr['number']}: {e}"})
+                continue
+            runs = [{"workflow": r.get("workflowName"), "url": r.get("url"), "status": r.get("status"),
+                     "conclusion": r.get("conclusion")} for r in found]
+            out.setdefault(path, {})[pr["number"]] = {"state": aggregate_runs(found), "runs": runs, "checked": now_iso()}
+    return out
+
+
+def cmd_sync(a):
+    # Read GitHub outside the lock (slow), then merge results under it.
+    snapshot = load()["cards"]
+    results = {}
+    # Children first, so each parent knows whether an attached PR is still open.
+    for key in sorted(snapshot, key=lambda k: 0 if snapshot[k].get("parent") else 1):
+        c = json.loads(json.dumps(snapshot[key]))
+        kids_open = any(rc.get("parent") == key and any(p.get("state") not in SETTLED for p in prs_of(rc))
+                        for rc, _, _ in results.values())
+        why, err = sync_card(c, kids_open)
+        results[key] = (c, why, err)
+    moves, errors = [], []
+    merge_ci = merge_ci_pass({k: r[0] for k, r in results.items()}, errors)
+    with Locked():
+        data = load()
+        for key, (c, why, err) in results.items():
+            cur = data["cards"].get(key)
+            if cur is None:
+                continue
+            # A local write since the snapshot wins over this pass.
+            if cur.get("updated") != snapshot[key].get("updated"):
+                continue
+            for p in [*c.get("prs", []), c.get("pr") or {}]:
+                if p.get("number") in merge_ci.get(key, {}):
+                    p["merge_ci"] = merge_ci[key][p["number"]]
+            data["cards"][key] = c
+            if why:
+                moves.append({"path": key, "repo": c.get("repo"), "issue": c.get("issue"), "title": c.get("title"), "stage": c["stage"], "why": why})
+            if err:
+                errors.append({"path": key, "error": err})
+        # A Done family whose child opened a new PR has open work again.
+        for key, c in data["cards"].items():
+            parent = data["cards"].get(c.get("parent") or "")
+            was = {p["number"] for p in prs_of(snapshot.get(key, {})) if p.get("state") not in SETTLED}
+            new_open = [p for p in prs_of(c) if p.get("state") not in SETTLED and p["number"] not in was]
+            if parent and parent.get("stage") == "done" and new_open:
+                why = f"attached PR #{new_open[0]['number']} opened"
+                if move_family(data["cards"], c["parent"], "in_review", why):
+                    moves.append({"path": c["parent"], "repo": parent.get("repo"), "issue": parent.get("issue"),
+                                  "title": parent.get("title"), "stage": "in_review", "why": why})
+        mirror_children(data["cards"])
+        data["synced"] = now_iso()
+        save(data)
+    out = {"synced": data["synced"], "moves": moves, "errors": errors}
+    if a.json:
+        print(json.dumps(out))
+    else:
+        for m in moves:
+            print(f"{m['repo']}#{m['issue']} → {m['stage']} ({m['why']})")
+        for e in errors:
+            print(f"error {e['path']}: {e['error']}", file=sys.stderr)
+        if not moves and not errors:
+            print("no changes")
+
+
+# ---------- team PRs waiting on you ----------
+
+REVIEWS = STORE.parent / "reviews.json"
+REVIEW_ORG = os.environ.get("HERDR_REVIEW_ORG") or config().get("org") or ""
+REVIEW_TEAM = os.environ.get("HERDR_REVIEW_TEAM") or config().get("review_team") or ""
+SEARCH_FIELDS = "number,repository,author,title,url,isDraft,createdAt,updatedAt"
+PR_DETAIL = "additions,deletions,changedFiles,statusCheckRollup,reviewDecision,reviews,reviewRequests,headRefName,baseRefName,isDraft"
+
+
+AVATARS = Path(os.environ.get("HERDR_APP_HOME", Path.home() / ".config/herdr-app")) / "mods/reviews/avatars"
+
+
+def fetch_avatar(login):
+    """A GitHub avatar cached where Herdr can draw it (images must live in its folder).
+    Returns the path relative to the app folder, or None. Refreshed weekly."""
+    if not login:
+        return None
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", login) + ".png"
+    dest = AVATARS / name
+    rel = f"mods/reviews/avatars/{name}"
+    if dest.exists() and time.time() - dest.stat().st_mtime < 7 * 86400:
+        return rel
+    try:
+        import urllib.request
+        # The REST user's avatar_url works for people and bots ("dependabot[bot]") alike.
+        r = subprocess.run(["gh", "api", f"users/{login}", "--jq", ".avatar_url"], capture_output=True, text=True, timeout=20)
+        base = r.stdout.strip()
+        if r.returncode != 0 or not base.startswith("https://"):
+            return rel if dest.exists() else None
+        url = base + ("&" if "?" in base else "?") + "s=64"
+        AVATARS.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "herdr-board"}), timeout=10) as resp:
+            if not resp.headers.get("Content-Type", "").startswith("image/"):
+                return rel if dest.exists() else None
+            data = resp.read()
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, dest)
+        return rel
+    except Exception:  # noqa: BLE001 - an avatar is cosmetic
+        return rel if dest.exists() else None
+
+
+def cmd_reviews(a):
+    """Open, non-draft PRs that request you or the team, or that a teammate opened and
+    you have not reviewed. Bot PRs (Dependabot) count like any other and carry
+    "bot": true so the panel can group them. Writes reviews.json for the panel."""
+    errors = []
+    if not REVIEW_ORG:
+        raise SystemExit("herdr-board: set \"org\" in ~/.claude/herdr/config.json to read reviews")
+    try:
+        me = subprocess.run(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True, timeout=30).stdout.strip()
+        team = [m for m in (gh(["api", f"orgs/{REVIEW_ORG}/teams/{REVIEW_TEAM}/members", "--jq", "[.[].login]"]) or []) if m != me] if REVIEW_TEAM else []
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"herdr-board: cannot read GitHub user or team: {e}")
+
+    found = {}  # url -> (search row, reason)
+
+    def search(args, why):
+        try:
+            for row in gh(["search", "prs", "--owner", REVIEW_ORG, "--state", "open", "--limit", "100", "--json", SEARCH_FIELDS, *args]) or []:
+                found.setdefault(row["url"], (row, why))
+        except Exception as e:  # noqa: BLE001
+            errors.append(str(e))
+
+    search(["--review-requested", "@me"], "requested you")
+    if REVIEW_TEAM:
+        search(["--", f"team-review-requested:{REVIEW_ORG}/{REVIEW_TEAM}"], f"{REVIEW_TEAM} team requested")
+    for login in team:
+        search(["--author", login], "no reviewer requested")
+
+    prs = []
+    for url, (row, why) in found.items():
+        author = (row.get("author") or {}).get("login", "")
+        if row.get("isDraft") or author == me:
+            continue
+        repo = row["repository"]["nameWithOwner"]
+        is_bot = author.endswith("[bot]") or bool((row.get("author") or {}).get("is_bot")) or author in ("dependabot", "app/dependabot")
+        try:
+            d = gh(["pr", "view", str(row["number"]), "--repo", repo, "--json", PR_DETAIL])
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{repo}#{row['number']}: {e}")
+            continue
+        if d.get("isDraft"):
+            continue
+        requested = [r.get("login") or r.get("slug") or r.get("name") for r in d.get("reviewRequests") or []]
+        mine = [r for r in d.get("reviews") or [] if (r.get("author") or {}).get("login") == me]
+        if me not in requested and mine:
+            continue  # you already reviewed, and nobody asked you again
+        if me in requested:
+            why = "requested you"
+        elif REVIEW_TEAM and (REVIEW_TEAM in requested or f"{REVIEW_ORG}/{REVIEW_TEAM}" in requested):
+            why = f"{REVIEW_TEAM} team requested"
+        # Latest verdict per other reviewer, for "octocat approved".
+        verdicts = {}
+        for r in d.get("reviews") or []:
+            who = (r.get("author") or {}).get("login")
+            if who and who != me and r.get("state") in ("APPROVED", "CHANGES_REQUESTED"):
+                verdicts[who] = r["state"]
+        others = [f"{w} {'approved' if s == 'APPROVED' else 'requested changes'}" for w, s in verdicts.items()]
+        prs.append({
+            "key": url, "url": url, "repo": repo, "number": row["number"], "title": row["title"], "author": author,
+            "created": row.get("createdAt"), "updated": row.get("updatedAt"),
+            "additions": d.get("additions", 0), "deletions": d.get("deletions", 0), "files": d.get("changedFiles", 0),
+            "head": d.get("headRefName"), "base": d.get("baseRefName"),
+            "review_decision": d.get("reviewDecision") or None, "ci": ci_summary(d.get("statusCheckRollup")),
+            "why": why, "others": others, "bot": is_bot,
+        })
+    prs.sort(key=lambda p: p.get("created") or "")
+    for p in prs:
+        p["avatar"] = fetch_avatar(p["author"])
+    out = {
+        "checked": now_iso(), "me": me, "team": team,
+        "prs": prs,
+        "errors": errors,
+    }
+    fd, tmp = tempfile.mkstemp(dir=REVIEWS.parent, prefix=".reviews-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(out, f, indent=2)
+    os.replace(tmp, REVIEWS)
+    if a.json:
+        print(json.dumps({"checked": out["checked"], "count": len(prs), "keys": [p["key"] for p in prs], "errors": errors}))
+    else:
+        for p in prs:
+            ci = (p["ci"] or {}).get("state", "-")
+            print(f"{p['repo'].split('/')[-1]}#{p['number']:<5} {p['author']:<14} ci:{ci:<4} +{p['additions']}/-{p['deletions']}  {p['title']}  ({p['why']})")
+        for e in errors:
+            print(f"error: {e}", file=sys.stderr)
+
+
+# ---------- GitHub Project status (board → GitHub) ----------
+
+PUSH_LOG = STORE.parent / "status-push.log"
+# Board stage → Project Status, with fallbacks for a Project that lacks the first choice.
+STATUS_FOR = {
+    "claimed": ["Todo"],
+    "planning": ["In Progress"],
+    "in_progress": ["In Progress"],
+    "pending": ["In Progress"],
+    "in_review": ["In Review", "In Progress"],
+    "done": ["Done"],
+}
+ITEMS_QUERY = """query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){issue(number:$n){
+  projectItems(first:30){nodes{id
+    project{id title closed field(name:"Status"){... on ProjectV2SingleSelectField{id options{id name}}}}
+    fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}}}}}}"""
+SET_STATUS = """mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){updateProjectV2ItemFieldValue(
+  input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$v}}){projectV2Item{id}}}"""
+
+
+def push_status(path):
+    """Sets Status on every open Project item of the card's issue to match its stage.
+
+    Reads the card's stage now, not when the move happened, so two quick moves whose
+    pushes finish out of order still leave GitHub at the latest stage. Never raises."""
+    def log(msg):
+        print(f"{now_iso()} {msg}", flush=True)
+    try:
+        card = load()["cards"].get(path)
+        if not card or card.get("parent") or not card.get("issue") or "/" not in (card.get("repo") or ""):
+            return
+        want = STATUS_FOR.get(card.get("stage"))
+        if not want:
+            return
+        owner, name = card["repo"].split("/", 1)
+        d = gh(["api", "graphql", "-f", f"query={ITEMS_QUERY}", "-f", f"o={owner}", "-f", f"r={name}",
+                "-F", f"n={card['issue']}"])
+        nodes = (((d or {}).get("data") or {}).get("repository") or {}).get("issue", {}).get("projectItems", {}).get("nodes", [])
+        for item in nodes:
+            proj = item.get("project") or {}
+            field = proj.get("field") or {}
+            if proj.get("closed") or not field.get("id"):
+                continue
+            options = {o["name"]: o["id"] for o in field.get("options", [])}
+            target = next((w for w in want if w in options), None)
+            current = (item.get("fieldValueByName") or {}).get("name")
+            if not target or current == target:
+                continue
+            gh(["api", "graphql", "-f", f"query={SET_STATUS}", "-f", f"p={proj['id']}", "-f", f"i={item['id']}",
+                "-f", f"f={field['id']}", "-f", f"v={options[target]}"])
+            log(f"{card['repo']}#{card['issue']} {proj.get('title')}: {current or '-'} → {target}")
+    except Exception as e:  # noqa: BLE001 - a status push must never surface as a failure
+        log(f"{path}: {e}")
+
+
+def cmd_push_status(a):
+    push_status(os.path.realpath(a.path))
+
+
+# ---------- GitHub Projects view ----------
+
+PROJECTS = STORE.parent / "projects.json"
+# Raw items per project, reused while the project's updatedAt is unchanged. An item's
+# Status or Phase edit bumps updatedAt. Titles, assignees and blocker state come fresh
+# from the REST search every run, so a cached project is only re-read after six hours.
+# A project that fails to read falls back to its cached items, whatever their age.
+PROJECTS_CACHE = STORE.parent / "projects-cache.json"
+CACHE_MAX_AGE = 6 * 3600
+PROJECT_ORG = os.environ.get("HERDR_PROJECT_ORG") or config().get("org") or ""
+STATUS_ORDER = {"In Review": 0, "In Progress": 1, "Todo": 2}
+REF = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
+
+
+PROJECTS_QUERY = """query($o:String!){organization(login:$o){projectsV2(first:50){nodes{
+  number title url closed updatedAt items{totalCount}}}}}"""
+# Only the named fields the view uses.
+# Asking for every field value (as `gh project item-list` does) is costly enough to trip
+# GitHub's per-minute secondary limit across a dozen projects. Titles and assignees of
+# open issues come from the REST search instead, which has its own budget.
+ITEMS_PAGE = """query($o:String!,$n:Int!,$after:String){organization(login:$o){projectV2(number:$n){
+  fields(first:40){nodes{... on ProjectV2SingleSelectField{name options{name}}}}
+  items(first:50,after:$after){pageInfo{hasNextPage endCursor} nodes{isArchived
+    content{__typename ... on Issue{number title url repository{nameWithOwner}}
+                       ... on PullRequest{number title url repository{nameWithOwner}}}
+    status: fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+    phase: fieldValueByName(name:"Phase"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+    blocked: fieldValueByName(name:"Blocked by"){... on ProjectV2ItemFieldTextValue{text}}
+    target: fieldValueByName(name:"Target"){... on ProjectV2ItemFieldDateValue{date}}}}}}}"""
+
+
+def graphql(query, **variables):
+    args = ["api", "graphql", "-f", f"query={query}"]
+    for k, v in variables.items():
+        if v is not None:
+            args += ["-F" if isinstance(v, int) else "-f", f"{k}={v}"]
+    d = gh(args, timeout=60) or {}
+    if d.get("errors"):
+        raise RuntimeError("; ".join(e.get("message", "") for e in d["errors"]))
+    return d.get("data") or {}
+
+
+def read_project(number):
+    """(phase option names, items) with each item in `gh project item-list`'s shape:
+    lowercased field names as keys, content with number/repository/type/url."""
+    phases, items, after = [], [], None
+    for _ in range(40):  # 2000 items; a stuck cursor must not loop forever
+        proj = graphql(ITEMS_PAGE, o=PROJECT_ORG, n=number, after=after)["organization"]["projectV2"]
+        # field(name:) errors on a project without the field, so pick Phase from the list.
+        phases = next(([o["name"] for o in f.get("options") or []]
+                       for f in (proj.get("fields") or {}).get("nodes", []) if (f or {}).get("name") == "Phase"), [])
+        page = proj["items"]
+        for node in page["nodes"]:
+            c = node.get("content") or {}
+            if node.get("isArchived") or not c.get("number"):
+                continue  # archived, or a draft with no issue to open
+            items.append({
+                "title": c.get("title"),
+                "content": {"number": c["number"], "title": c.get("title"), "url": c.get("url"), "type": c.get("__typename"),
+                            "repository": (c.get("repository") or {}).get("nameWithOwner")},
+                "status": (node.get("status") or {}).get("name"),
+                "phase": (node.get("phase") or {}).get("name"),
+                "blocked by": (node.get("blocked") or {}).get("text"),
+                "target": (node.get("target") or {}).get("date"),
+            })
+        if not page["pageInfo"]["hasNextPage"]:
+            return phases, items
+        after = page["pageInfo"]["endCursor"]
+    raise RuntimeError(f"project {number}: more than 40 pages of items")
+
+
+def open_issues():
+    """Every open org issue as {"owner/name#n": {title, assignees}}, from the REST search
+    API (its own rate budget, 100 issues a call). A blocker absent from this map is closed."""
+    out = {}
+    for page in range(1, 11):
+        q = f"org:{PROJECT_ORG} is:issue is:open archived:false"
+        d = gh(["api", "-X", "GET", "search/issues", "-f", f"q={q}", "-f", "per_page=100", "-f", f"page={page}"], timeout=60) or {}
+        batch = d.get("items") or []
+        for it in batch:
+            repo = it["repository_url"].split("/repos/", 1)[1]
+            out[f"{repo}#{it['number']}"] = {"title": it.get("title"), "assignees": [a["login"] for a in it.get("assignees") or []]}
+        if len(batch) < 100:
+            return out
+    return out
+
+
+def project_item(it, states):
+    c = it.get("content") or {}
+    refs = [f"{m[0]}#{m[1]}" for m in REF.findall(it.get("blocked by") or "")]
+    holding = [r for r in refs if states.get(r) == "OPEN"]
+    return {
+        "repo": c.get("repository"), "number": c.get("number"), "title": it.get("title") or c.get("title"),
+        "url": c.get("url"), "type": c.get("type"), "status": it.get("status") or "Todo", "phase": it.get("phase"),
+        "assignees": [{"login": a, "avatar": None} for a in it.get("assignees") or []],
+        "blocked_by": holding, "ready": bool(refs) and not holding,
+    }
+
+
+# Shown as one flat list by status whatever fields it carries: triage is a queue, not a plan.
+FLAT_PROJECTS = ("Triage",)
+
+
+def build_project(p, phases, raw, states):
+    if p.get("title") in FLAT_PROJECTS:
+        phases = []
+    items = [project_item(it, states) for it in raw if (it.get("content") or {}).get("number")]
+    open_ = sorted((i for i in items if i["status"] != "Done"), key=lambda i: STATUS_ORDER.get(i["status"], 3))
+    target = next((it.get("target") for it in raw if it.get("target")), None)
+    out = {"number": p["number"], "title": p["title"], "url": p.get("url"), "target": target,
+           "open": len(open_), "blocked": sum(1 for i in open_ if i["blocked_by"]), "phases": []}
+    if not phases:
+        out["items"] = open_
+        return out
+    for name in phases:
+        inp = [i for i in items if i["phase"] == name]
+        counts = {s: sum(1 for i in inp if i["status"] == s) for s in ("Done", "In Review", "In Progress")}
+        counts["Todo"] = len(inp) - sum(counts.values())
+        out["phases"].append({"name": name, "total": len(inp), "counts": counts})
+    cur = next((ph["name"] for ph in out["phases"] if ph["total"] > ph["counts"]["Done"]), None)
+    for ph in out["phases"]:
+        ph["state"] = "current" if ph["name"] == cur else "done" if cur is None or phases.index(ph["name"]) < phases.index(cur) else "upcoming"
+    out["current"] = cur
+    out["next"] = phases[phases.index(cur) + 1] if cur and phases.index(cur) + 1 < len(phases) else None
+    out["items"] = [i for i in open_ if i["phase"] == cur]
+    out["later_blocked"] = [i for i in open_ if i["phase"] and i["phase"] != cur and i["blocked_by"]]
+    out["unphased"] = [i for i in open_ if not i["phase"]]
+    return out
+
+
+def cmd_projects(a):
+    """Every open org Project: its current phase, phase completion by status, open
+    items with assignees, and what still blocks them. Writes projects.json. Read only."""
+    from concurrent.futures import ThreadPoolExecutor
+    errors = []
+    if not PROJECT_ORG:
+        raise SystemExit("herdr-board: set \"org\" in ~/.claude/herdr/config.json to read projects")
+    try:
+        listed = graphql(PROJECTS_QUERY, o=PROJECT_ORG)["organization"]["projectsV2"]["nodes"]
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"herdr-board: cannot list {PROJECT_ORG} projects: {e}")
+    wanted = [p for p in listed
+              if not p.get("closed") and (p.get("items") or {}).get("totalCount", 1) > 0 and "template" not in p["title"].lower()]
+
+    try:
+        cache = json.loads(PROJECTS_CACHE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        cache = {}
+    reused = []
+    limited = []
+
+    def fetch(p):
+        hit = cache.get(str(p["number"]))
+        if (not a.full and hit and hit.get("updatedAt") == p.get("updatedAt")
+                and time.time() - hit.get("read", 0) < CACHE_MAX_AGE):
+            reused.append(p["title"])
+            return p, hit["phases"], hit["items"], None
+        # One pause and retry for a per-minute limit. Once a limit holds, the rest of
+        # the run stops calling GitHub and serves cached items: retrying every project
+        # against a spent hourly budget only burns minutes.
+        err = f"{p['title']}: skipped, GitHub rate limit reached earlier in this run"
+        for wait in (0, 20):
+            if limited:
+                break
+            time.sleep(wait)
+            try:
+                phases, raw = read_project(p["number"])
+                cache[str(p["number"])] = {"updatedAt": p.get("updatedAt"), "read": time.time(), "phases": phases, "items": raw}
+                return p, phases, raw, None
+            except Exception as e:  # noqa: BLE001
+                err = f"{p['title']}: {e}"
+                if "rate limit" not in str(e).lower():
+                    break
+                if wait:
+                    limited.append(True)
+        if hit:
+            reused.append(p["title"])
+            return p, hit["phases"], hit["items"], f"{err} (showing cached items)"
+        return p, [], [], err
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fetched = list(pool.map(fetch, wanted))
+    fd, tmp = tempfile.mkstemp(dir=PROJECTS_CACHE.parent, prefix=".projects-cache-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump({k: v for k, v in cache.items() if int(k) in {p["number"] for p in wanted}}, f)
+    os.replace(tmp, PROJECTS_CACHE)
+    errors += [err for _, _, _, err in fetched if err]
+    try:
+        opened = open_issues()
+    except Exception as e:  # noqa: BLE001
+        # Without the open set every blocker would read as closed: keep the last good file.
+        raise SystemExit(f"herdr-board: cannot read open issues, projects.json left as it was: {e}")
+    states = {ref: "OPEN" for ref in opened}
+    for _, _, raw, _ in fetched:
+        for it in raw:
+            c = it.get("content") or {}
+            fresh = opened.get(f"{c.get('repository')}#{c.get('number')}")
+            if fresh:
+                it["title"], it["assignees"] = fresh["title"], fresh["assignees"]
+    projects = [build_project(p, phases, raw, states) for p, phases, raw, err in fetched if raw or not err]
+    if not projects:
+        raise SystemExit("herdr-board: no project could be read, projects.json left as it was: " + "; ".join(errors))
+    # Phased projects first (newest first), then unphased ones, Triage last.
+    projects.sort(key=lambda p: (p["title"] == "Triage", not p["phases"], -p["number"]))
+    avatars = {}
+    for p in projects:
+        for group in ("items", "later_blocked", "unphased"):
+            for i in p.get(group, []):
+                for who in i["assignees"]:
+                    if who["login"] not in avatars:
+                        avatars[who["login"]] = fetch_avatar(who["login"])
+                    who["avatar"] = avatars[who["login"]]
+    out = {"checked": now_iso(), "org": PROJECT_ORG, "projects": projects, "errors": errors, "reused": len(reused)}
+    fd, tmp = tempfile.mkstemp(dir=PROJECTS.parent, prefix=".projects-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(out, f, indent=2)
+    os.replace(tmp, PROJECTS)
+    if a.json:
+        print(json.dumps({"checked": out["checked"], "projects": len(projects), "errors": errors}))
+    else:
+        for p in projects:
+            where = f"{p['current']} → {p['next'] or 'last'}" if p.get("current") else "all phases done" if p["phases"] else "no phases"
+            print(f"{p['title']:<34} {where:<44} open {p['open']:<3} blocked {p['blocked']}")
+        for e in errors:
+            print(f"error: {e}", file=sys.stderr)
+
+
+# ---------- Claude Code hook ----------
+
+PLANNING_DIRS = ("docs/plans/", "docs/specs/", "docs/superpowers/", "docs/memory/", ".claude/")
+PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+")
+
+
+def worktree_has_work(path):
+    """Changed files outside the planning folders, or commits not on origin's default branch."""
+    def git(*args):
+        r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=5)
+        return r.stdout if r.returncode == 0 else ""
+    for line in git("status", "--porcelain", "--untracked-files=all").splitlines():
+        rel = line[3:].split(" -> ")[-1].strip('"')
+        if rel and not rel.startswith(PLANNING_DIRS):
+            return True
+    base = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").strip() or "origin/main"
+    return git("rev-list", "--count", f"{base}..HEAD").strip() not in ("", "0")
+
+
+CD_DIR = re.compile(r"""(?:^|[;&|(]|\s)(?:cd|pushd)\s+("[^"]+"|'[^']+'|[^\s;&|)]+)""")
+GIT_C = re.compile(r"""\bgit\s+-C\s+("[^"]+"|'[^']+'|[^\s;&|)]+)""")
+REPO_FLAG = re.compile(r"(?:--repo|-R)(?:\s+|=)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)")
+GH_REMOTE = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$")
+WORKTREE_ROOTS = (Path.home() / ".herdr/worktrees",)
+
+
+def command_dirs(cmd, cwd):
+    """Folders a shell command points at with cd, pushd or git -C, as real paths."""
+    out = []
+    for m in [*CD_DIR.finditer(cmd), *GIT_C.finditer(cmd)]:
+        d = os.path.expanduser(m.group(1).strip("\"'"))
+        if "$" in d or "`" in d:
+            continue
+        out.append(os.path.realpath(os.path.join(cwd, d)))
+    return out
+
+
+def git_worktree(path):
+    """(root, owner/name, branch) for the linked worktree holding path, else None.
+
+    A repo's main checkout never qualifies: a card there would offer to remove the
+    primary clone."""
+    d = path
+    while d and not os.path.isdir(d):
+        d = os.path.dirname(d)
+    if not d:
+        return None
+    def git(*args):
+        r = subprocess.run(["git", "-C", d, *args], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else None
+    out = git("rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir", "--abbrev-ref", "HEAD")
+    if not out or len(out.splitlines()) != 4:
+        return None
+    top, gitdir, common, branch = out.splitlines()
+    if os.path.realpath(os.path.join(d, gitdir)) == os.path.realpath(os.path.join(d, common)):
+        return None
+    m = GH_REMOTE.search(git("remote", "get-url", "origin") or "")
+    if not m or branch == "HEAD":
+        return None
+    return os.path.realpath(top), m.group(1), branch
+
+
+def locate(cards, home, path):
+    """Where a path sits relative to home's family: (key, None) for home or one of its
+    children, (root, (root, repo, branch)) for a linked worktree with no card yet, and
+    (None, None) for anything else. Another family's card is never ours to touch."""
+    k = resolve(cards, path)
+    if k:
+        return (k, None) if k == home or cards[k].get("parent") == home else (None, None)
+    wt = git_worktree(path)
+    return (wt[0], wt) if wt else (None, None)
+
+
+def find_child_for_repo(cards, home, repo, candidates, pr_url):
+    """The family worktree a PR in another repo came from: a folder the command named,
+    then an existing child in that repo, then a worktree on disk holding the PR's branch."""
+    for key, wt in candidates:
+        if (wt and wt[1] == repo) or (not wt and cards.get(key, {}).get("repo") == repo and key != home):
+            return key, wt
+    kids = [k for k in children(cards, home) if cards[k].get("repo") == repo]
+    try:
+        head = gh(["pr", "view", pr_url, "--json", "headRefName"], timeout=10)["headRefName"]
+    except Exception:  # noqa: BLE001 - no network: fall back to what is known locally
+        head = None
+    for k in kids:
+        live = git_worktree(k) if head else None
+        if head is None or cards[k].get("branch") == head or (live and live[2] == head):
+            return k, live
+    if head:
+        name = repo.split("/")[-1]
+        for root in WORKTREE_ROOTS:
+            for d in sorted((root / name).glob("*")) if (root / name).is_dir() else []:
+                wt = git_worktree(str(d))
+                if wt and wt[1] == repo and wt[2] == head and not resolve(cards, wt[0]):
+                    return wt[0], wt
+    return None, None
+
+
+def cmd_hook(_a):
+    """PostToolUse hook. Never fails the tool call: every error exits 0.
+
+    The card a session works for is its home card: remembered per session id, so a
+    session whose shell has cd'd elsewhere still knows whose work it is doing. Work that
+    lands in another linked worktree goes on a child card of home, never on home itself."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        cwd = payload.get("cwd") or os.getcwd()
+        sid = payload.get("session_id")
+        data = load()
+        cards = data["cards"]
+        home = data.get("sessions", {}).get(sid) if sid else None
+        record = False
+        if home not in cards:
+            k = resolve(cards, cwd)
+            if not k:
+                return
+            home, record = head_of(cards, k), bool(sid)
+        home = head_of(cards, home)
+        card = cards[home]
+        stage = card.get("stage")
+        tool = payload.get("tool_name", "")
+
+        family = None       # (stage, why, only_from or None): move home and its children
+        home_pr = None      # PR URL for home
+        child = None        # (key, wt or None): a family worktree to attach or update
+        child_pr = None     # (url or None, state)
+
+        if tool in ("Edit", "Write", "NotebookEdit"):
+            ti = payload.get("tool_input") or {}
+            fp = ti.get("file_path") or ti.get("notebook_path") or ""
+            if not fp:
+                return
+            fp = os.path.realpath(os.path.join(cwd, fp))
+            key, wt = locate(cards, home, fp)
+            if not key:
+                pass
+            elif key == home:
+                rel = fp[len(os.path.realpath(home)) + 1:]
+                # Only code counts, not session notes and plans: a planning session writes
+                # memory files and docs/plans before any code.
+                if stage not in ("done", "pending", "in_progress") and not rel.startswith(PLANNING_DIRS):
+                    family = ("in_progress", "edit", None)
+            else:
+                rel = fp[len(key) + 1:]
+                if not rel.startswith(PLANNING_DIRS):
+                    child = (key, wt)
+                    family = ("in_progress", "edit in attached worktree", ("claimed", "planning"))
+        elif tool == "Bash":
+            cmd = (payload.get("tool_input") or {}).get("command", "")
+            candidates = []
+            for d in [*command_dirs(cmd, cwd), os.path.realpath(cwd)]:
+                key, wt = locate(cards, home, d)
+                if key and all(key != c[0] for c in candidates):
+                    candidates.append((key, wt))
+            foreign = next((c for c in candidates if c[0] != home), None)
+            m = REPO_FLAG.search(cmd)
+            named_repo = m.group(1) if m else None
+            if "gh pr merge" in cmd:
+                url = PR_URL.search(cmd)
+                repo = named_repo or (url and re.search(r"github\.com/([^/]+/[^/]+)/pull", url.group(0)).group(1))
+                if repo and repo != card.get("repo"):
+                    n = re.search(r"gh pr merge\s+(\d+)\b", cmd)
+                    merged = url.group(0) if url else f"https://github.com/{repo}/pull/{n.group(1)}" if n else None
+                    k, wt = find_child_for_repo(cards, home, repo, candidates, merged or "")
+                    if k:
+                        child, child_pr = (k, wt), (merged, "MERGED")
+                elif foreign and not repo:
+                    child, child_pr = foreign, (None, "MERGED")
+                else:
+                    own_open = [p for p in prs_of(card) if p.get("state") not in SETTLED]
+                    kids_open = any(p.get("state") not in SETTLED
+                                    for k in children(cards, home) for p in prs_of(cards[k]))
+                    # One merge among several open PRs is not the end: sync decides Done.
+                    if len(own_open) <= 1 and not kids_open:
+                        family = ("done", "gh pr merge", None)
+            elif "gh pr create" in cmd:
+                m = PR_URL.search(json.dumps(payload.get("tool_response", "")))
+                url = m.group(0) if m else None
+                repo = re.search(r"github\.com/([^/]+/[^/]+)/pull", url).group(1) if url else named_repo
+                if repo and card.get("repo") and repo != card["repo"]:
+                    k, wt = find_child_for_repo(cards, home, repo, candidates, url or "")
+                    if k:
+                        child, child_pr = (k, wt), (url, "OPEN")
+                elif foreign and not url:
+                    pass  # a PR from another worktree whose URL never showed: sync finds it by branch
+                else:
+                    family, home_pr = ("in_review", "gh pr create", None), url
+            elif "git push" in cmd:
+                if foreign:
+                    child = foreign
+                elif stage == "in_progress" and card.get("pr", {}).get("state") == "OPEN":
+                    family = ("in_review", "git push", None)
+            elif foreign and worktree_has_work(foreign[0]):
+                # Shell edits and commits in an attached worktree are work on home's issue.
+                child = foreign
+                family = ("in_progress", "shell change in attached worktree", ("claimed", "planning"))
+            elif stage in ("claimed", "planning") and worktree_has_work(home):
+                # Shell edits (printf >> file, sed -i, a codemod) and commits count too.
+                family = ("in_progress", "shell change", None)
+        if not (family or child or record):
+            return
+
+        with Locked():
+            data = load()
+            cards = data["cards"]
+            if home not in cards:
+                return
+            changed = False
+            if record:
+                sessions = data.setdefault("sessions", {})
+                sessions[sid] = home
+                # Forget sessions whose card is gone; the map only ever grows otherwise.
+                for s in [s for s, k in sessions.items() if k not in cards]:
+                    del sessions[s]
+                changed = True
+            if child:
+                key, wt = child
+                if key not in cards and wt:
+                    root, repo, branch = wt
+                    cards[key] = {"created": now_iso(), "path": root, "repo": repo, "branch": branch,
+                                  "title": branch, "parent": home}
+                    move(cards[key], cards[home].get("stage", "planning"), "attached")
+                    changed = True
+                c = cards.get(key)
+                if c and c.get("parent") == home and child_pr:
+                    url, state = child_pr
+                    if wt and wt[2] != c.get("branch"):
+                        c["branch"] = wt[2]
+                    before = json.dumps(prs_of(c), sort_keys=True)
+                    if url:
+                        add_pr(c, {"url": url, "number": int(url.rsplit("/", 1)[1]), "state": state})
+                    elif state == "MERGED":
+                        # A merge with no URL: the open PR on the worktree's branch.
+                        live = [p for p in prs_of(c) if p.get("state") not in SETTLED]
+                        if len(live) == 1:
+                            add_pr(c, {**live[0], "state": "MERGED"})
+                    if json.dumps(prs_of(c), sort_keys=True) != before:
+                        c["updated"] = now_iso()
+                        changed = True
+            if family:
+                target, why, only_from = family
+                hs = cards[home].get("stage")
+                if (only_from is None or hs in only_from) and not (hs in ("done", "pending") and target != "done"):
+                    changed = move_family(cards, home, target, why) or changed
+            if home_pr:
+                add_pr(cards[home], {"url": home_pr, "number": int(home_pr.rsplit("/", 1)[1]), "state": "OPEN"})
+                changed = True
+            if changed:
+                save(data)
+    except BaseException:  # noqa: BLE001 - a hook must never block the tool call
+        if os.environ.get("HERDR_BOARD_DEBUG"):
+            import traceback
+            traceback.print_exc()
+        return
+
+
+# ---------- main ----------
+
+def main():
+    p = argparse.ArgumentParser(prog="herdr-board", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("add", help="add or update a card")
+    s.add_argument("--path")
+    s.add_argument("--repo", help="owner/name")
+    s.add_argument("--issue", type=int)
+    s.add_argument("--branch")
+    s.add_argument("--title")
+    s.add_argument("--stage", default="planning")
+    s.add_argument("--parent", help="attach as a child of this card (its stage follows the parent)")
+    s.set_defaults(fn=cmd_add)
+
+    s = sub.add_parser("set", help="move a card to a stage")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--stage", required=True)
+    s.add_argument("--why")
+    s.set_defaults(fn=cmd_set)
+
+    s = sub.add_parser("pending", help="park a card as Pending until a date")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--for", dest="reason", required=True, help="what it waits on")
+    s.add_argument("--until", required=True, help="YYYY-MM-DD, +3d or +1w")
+    s.set_defaults(fn=cmd_pending)
+
+    s = sub.add_parser("snooze", help="give a Pending card a new date")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--until", required=True)
+    s.set_defaults(fn=cmd_snooze)
+
+    s = sub.add_parser("resume", help="Pending back to In progress")
+    s.add_argument("path", nargs="?")
+    s.set_defaults(fn=cmd_resume)
+
+    s = sub.add_parser("pr", help="attach a PR URL")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--url", required=True)
+    s.set_defaults(fn=cmd_pr)
+
+    s = sub.add_parser("rm", help="remove a card (never the checkout)")
+    s.add_argument("path", nargs="?")
+    s.set_defaults(fn=cmd_rm)
+
+    s = sub.add_parser("list", help="list cards")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("show", help="show one card")
+    s.add_argument("path", nargs="?")
+    s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("sync", help="one GitHub pass")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_sync)
+
+    s = sub.add_parser("reviews", help="team PRs waiting on your review (writes reviews.json)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_reviews)
+
+    s = sub.add_parser("projects", help="org Projects: phase, blockers, assignees (writes projects.json)")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--full", action="store_true", help="re-read every project, ignoring the cache")
+    s.set_defaults(fn=cmd_projects)
+
+    s = sub.add_parser("push-status", help="set the card's issue Status in its GitHub Projects")
+    s.add_argument("path")
+    s.set_defaults(fn=cmd_push_status)
+
+    s = sub.add_parser("hook", help="Claude Code PostToolUse hook (reads the payload on stdin)")
+    s.set_defaults(fn=cmd_hook)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

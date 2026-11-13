@@ -1,0 +1,118 @@
+#!/bin/sh
+# herdr-review: check a PR out into its own worktree and open a Herdr review space
+# with a Claude session running the code-review command (config.json "review_command",
+# default "/code-review:code-review"; the PR number is appended).
+#
+#   herdr-review <owner/repo> <number> [--setup]
+#
+# The worktree is ~/.herdr/worktrees/<repo>/pr-<n>, on the PR's own branch (gh pr
+# checkout), so tests can run and fixups can be pushed. An existing one is reused and
+# updated. --setup also runs the repo's setup command (config.json "setup", by repo name).
+# Review worktrees are not board cards. Removing one is your call:
+#   git -C <clone> worktree remove ~/.herdr/worktrees/<repo>/pr-<n>
+
+set -eu
+die() { printf 'herdr-review: %s\n' "$*" >&2; exit 1; }
+
+[ $# -ge 2 ] || die "usage: herdr-review <owner/repo> <number> [--setup]"
+FULL=$1; N=$2; SETUP=0
+[ "${3:-}" = "--setup" ] && SETUP=1
+command -v jq >/dev/null || die "jq is required"
+CONFIG="${HERDR_BOARD_CONFIG:-$HOME/.claude/herdr/config.json}"
+cfg() { jq -r "$1 // empty" "$CONFIG" 2>/dev/null || true; }
+# Folders holding your clones, from config.json "clones" (default ~/repos).
+clone_dirs() {
+  dirs=$(jq -r '.clones[]? // empty' "$CONFIG" 2>/dev/null || true)
+  [ -n "$dirs" ] || dirs="~/repos"
+  printf '%s\n' "$dirs" | sed "s|^~|$HOME|"
+}
+find_clone() { # find_clone <owner/repo>: the first clone whose origin is that repo
+  name=${1#*/}
+  for d in $(clone_dirs); do
+    if [ -e "$d/$name/.git" ] && git -C "$d/$name" remote get-url origin 2>/dev/null | grep -qi "[:/]$1\(\.git\)\{0,1\}$"; then echo "$d/$name"; return 0; fi
+  done
+  return 1
+}
+ORG=$(cfg .org)
+case $FULL in */*) ;; *) [ -n "$ORG" ] || die "give owner/repo, or set \"org\" in $CONFIG"; FULL="$ORG/$FULL" ;; esac
+REPO=${FULL#*/}
+
+SRC=$(find_clone "$FULL") || die "no clone of $FULL in: $(clone_dirs | tr '\n' ' ')"
+
+REVIEW_CMD=$(cfg .review_command); [ -n "$REVIEW_CMD" ] || REVIEW_CMD="/code-review:code-review"
+DIR="$HOME/.herdr/worktrees/$REPO/pr-$N"
+NAME="Review $REPO #$N"
+
+# An open review space for this PR: select it rather than make a second.
+existing=$(herdr-app ls 2>/dev/null | jq -r --arg n "$NAME" '.spaces[] | select(.name == $n) | .id' | head -1)
+if [ -n "$existing" ]; then
+  herdr-app do space.select "$(jq -nc --arg i "$existing" '{id:$i}')" >/dev/null
+  echo "Review space already open: $NAME"
+  exit 0
+fi
+
+git -C "$SRC" fetch --quiet origin
+
+# A branch can be checked out in one worktree only. When the PR's head branch already has
+# one (your own PR's feature worktree), review there instead of making pr-<n>.
+HEAD_REF=$(gh pr view "$N" --repo "$FULL" --json headRefName,isCrossRepository \
+  --jq 'select(.isCrossRepository | not) | .headRefName' 2>/dev/null || true)
+OWNER=""
+if [ -n "$HEAD_REF" ]; then
+  OWNER=$(git -C "$SRC" worktree list --porcelain | awk -v b="branch refs/heads/$HEAD_REF" '
+    /^worktree / { wt = substr($0, 10) } $0 == b { print wt; exit }')
+fi
+
+if [ -n "$OWNER" ] && [ "$OWNER" != "$DIR" ]; then
+  DIR=$OWNER
+  echo "$HEAD_REF is already checked out at $DIR; reviewing there"
+elif [ -d "$DIR" ]; then
+  (cd "$DIR" && gh pr checkout "$N" --repo "$FULL" --force >/dev/null 2>&1) || echo "herdr-review: could not update $DIR; using it as is" >&2
+else
+  base=$(git -C "$SRC" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)
+  mkdir -p "$(dirname "$DIR")"
+  git -C "$SRC" worktree add --quiet --detach "$DIR" "$base"
+  # A failed checkout leaves a worktree detached at the base branch; remove it, or the
+  # next run would reuse it and review the base branch instead of the PR.
+  (cd "$DIR" && gh pr checkout "$N" --repo "$FULL" >/dev/null) || {
+    git -C "$SRC" worktree remove --force "$DIR" 2>/dev/null || true
+    die "gh pr checkout $N failed in $DIR"
+  }
+fi
+echo "Checked out $FULL#$N at $DIR ($(git -C "$DIR" rev-parse --abbrev-ref HEAD))"
+
+if [ $SETUP = 1 ]; then
+  setup=$(jq -r --arg r "$REPO" '.setup[$r] // empty' "$CONFIG" 2>/dev/null || true)
+  [ -n "$setup" ] && { echo "Running setup: $setup"; (cd "$DIR" && sh -c "$setup") || echo "herdr-review: setup failed" >&2; }
+fi
+
+# Reviewing in your own worktree: that worktree's space already exists, and the board reaches
+# a worktree through one space only, so a second space there can't be opened. Add a
+# "Review #<n>" tab to the existing space instead.
+HOME_SPACE=""
+if [ "$DIR" = "$OWNER" ]; then
+  HOME_SPACE=$(herdr-app ls 2>/dev/null | jq -r --arg f "$DIR" \
+    '[.spaces[] | select(.folder == $f and ((.name // "") | startswith("Review ") | not))][0].id // empty')
+fi
+
+TAB_NAME="Review #$N"
+if [ -n "$HOME_SPACE" ]; then
+  open_tab=$(herdr-app ls | jq -r --arg s "$HOME_SPACE" --arg n "$TAB_NAME" '.spaces[] | select(.id == $s) | .tabs[] | select(.name == $n) | .id' | head -1)
+  if [ -n "$open_tab" ]; then
+    herdr-app do tab.select "$(jq -nc --arg i "$open_tab" '{id:$i}')" >/dev/null
+    echo "Review tab already open: $TAB_NAME"
+    exit 0
+  fi
+  made=$(herdr-app do tab.new "$(jq -nc --arg s "$HOME_SPACE" --arg n "$TAB_NAME" --arg f "$DIR" --arg t "$REVIEW_CMD $N" \
+    '{space:$s, name:$n, folder:$f, argv:["claude"], task:$t}')") || die "could not open a Herdr tab (is Herdr running?)"
+  tab=$(printf '%s' "$made" | jq -r '.tab')
+  herdr-app do tab.select "$(jq -nc --arg i "$tab" '{id:$i}')" >/dev/null 2>&1 || true
+  OPENED="$TAB_NAME in your worktree's space"
+else
+  made=$(herdr-app do space.new "$(jq -nc --arg n "$NAME" --arg f "$DIR" --arg t "$REVIEW_CMD $N" \
+    '{name:$n, folder:$f, argv:["claude"], task:$t}')" >/dev/null) || die "could not open a Herdr space (is Herdr running?)"
+  OPENED=$NAME
+fi
+
+# The kanbandrawer layout shows the PR in the space's stage column, so it gets no pane of its own.
+echo "Opened $OPENED"

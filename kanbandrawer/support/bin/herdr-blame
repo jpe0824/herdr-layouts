@@ -1,0 +1,412 @@
+#!/usr/bin/env -S python3 -I
+"""herdr-blame: which Claude Code turn wrote each added line of a pull request.
+
+    herdr-blame <owner/repo> <number> [--json] [--no-cache]
+
+Reads the PR diff from `gh`, finds the Claude Code transcripts recorded on the PR's
+head branch (~/.claude/projects/*/*.jsonl and their subagents/), and matches every
+added line to the latest transcript edit (Edit/Write/MultiEdit) that added the same
+text to the same file. Read-only apart from its cache in ~/.claude/herdr/blame/.
+
+Matching is by line text, so it sees only edits made through Claude's edit tools.
+Lines written by Bash, code generators, formatters or by hand come out `untraced`.
+
+The transcript format is Claude Code's internal one and may change between versions;
+everything that reads it is in `read_transcript`.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HOME = Path.home()
+PROJECTS = HOME / ".claude/projects"
+BOARD = HOME / ".claude/herdr/board.json"
+CACHE = HOME / ".claude/herdr/blame"
+CACHE_VERSION = 5
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
+# Lines too common to say anything on their own; they take the owner of a neighbour.
+TRIVIAL = re.compile(r"^[\s{}()\[\];,.:]*$|^(?:else:?|try:|finally:|pass|return|break|continue|end|\*/|/\*\*?|#|//|\"\"\"|''')$")
+# Lines no edit tool writes: lockfiles and other generated output. Reported apart.
+GENERATED = re.compile(r"(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|uv\.lock|Pipfile\.lock|Cargo\.lock|go\.sum)$|\.gen\.[jt]sx?$|\.min\.(js|css)$|(^|/)(dist|build)/|\.snap$")
+
+
+def die(msg):
+    print(f"herdr-blame: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def gh(*args):
+    r = subprocess.run(["gh", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        die((r.stderr or "gh failed").strip())
+    return r.stdout
+
+
+# ---------- the PR ----------
+
+def added_lines(diff_text):
+    """{path: [(new_line_no, text, hunk_index, previous_line)]} for every `+` line of a
+    unified diff. previous_line is the nearest non-blank line above it in the new file."""
+    files, path, new, hunk, prev = {}, None, 0, -1, ""
+    for line in diff_text.split("\n"):
+        if line.startswith("diff --git "):
+            path = re.sub(r"^diff --git a/.* b/", "", line)
+            files.setdefault(path, [])
+            hunk = -1
+            continue
+        if path is None or re.match(r"^(index |--- |\+\+\+ |new file|deleted file|similarity|rename |old mode|new mode)", line):
+            continue
+        m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)", line)
+        if m:
+            new, hunk, prev = int(m.group(1)), hunk + 1, ""
+        elif line.startswith("+"):
+            files[path].append((new, line[1:], hunk, prev))
+            prev = norm(line[1:]) or prev
+            new += 1
+        elif line.startswith(" "):
+            prev = norm(line[1:]) or prev
+            new += 1
+    return files
+
+
+# ---------- transcripts ----------
+
+def project_dir(path):
+    return PROJECTS / re.sub(r"[^A-Za-z0-9-]", "-", path)
+
+
+def transcript_files(repo, branch):
+    """Main and subagent transcripts that recorded this branch. Searches the project
+    folders whose name carries the repo's name (its checkouts and worktrees) first, and
+    every project only when none of those recorded the branch."""
+    found = set()
+    try:
+        cards = json.loads(BOARD.read_text()).get("cards", {})
+        for card in cards.values():
+            if card.get("branch") == branch and card.get("path"):
+                d = project_dir(card["path"])
+                found.update(glob.glob(str(d / "*.jsonl")) + glob.glob(str(d / "*/subagents/**/agent-*.jsonl"), recursive=True))
+    except (OSError, ValueError):
+        pass
+    needle = f'"gitBranch":"{branch}"'
+    name = re.sub(r"[^A-Za-z0-9-]", "-", repo.split("/")[-1])
+
+    def scan(pattern):
+        every = glob.glob(str(PROJECTS / pattern / "*.jsonl")) + glob.glob(str(PROJECTS / pattern / "*/subagents/**/agent-*.jsonl"), recursive=True)
+        hits = set()
+        for i in range(0, len(every), 500):
+            r = subprocess.run(["grep", "-l", "-F", "--", needle, *every[i:i + 500]], capture_output=True, text=True)
+            hits.update(p for p in r.stdout.splitlines() if p)
+        return hits
+
+    found |= scan(f"*{glob.escape(name)}*")
+    if not found:
+        found |= scan("*")
+    return sorted(found)
+
+
+def norm(s):
+    return s.strip()
+
+
+def pairs(lines):
+    """(previous non-blank line, added line) for each `+` line of a hunk's lines."""
+    out, prev = [], ""
+    for l in lines:
+        if l.startswith("-"):
+            continue
+        if l.startswith("+"):
+            out.append((prev, l[1:]))
+        prev = norm(l[1:]) or prev
+    return out
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+    return ""
+
+
+def is_prompt(rec):
+    if rec.get("type") != "user" or rec.get("isMeta") or rec.get("isCompactSummary") or rec.get("toolUseResult") is not None:
+        return False
+    content = rec.get("message", {}).get("content")
+    if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+        return False
+    return bool(text_of(content).strip())
+
+
+def read_transcript(path, branch, turns, edits):
+    """Adds this file's turns and edits. A turn is one promptId; subagent records carry
+    the promptId of the parent turn that started them."""
+    sub = "/subagents/" in path
+    agent = None
+    if sub:
+        try:
+            agent = json.loads(Path(path.replace(".jsonl", ".meta.json")).read_text()).get("description")
+        except (OSError, ValueError):
+            agent = "subagent"
+    session = path.split("/subagents/")[0].rsplit("/", 1)[1] if sub else Path(path).stem
+    current = None
+    asks = {}  # tool_use id -> turn, question text
+    opened = set()  # turns whose first record in this main transcript was seen
+    last_human = None  # the latest turn a person started, in file order
+    try:
+        fh = open(path, encoding="utf-8")
+    except OSError:
+        return
+    with fh:
+        for raw in fh:
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            pid = rec.get("promptId")
+            if pid:
+                current = pid
+            if not current:
+                continue
+            turn = turns.setdefault(current, {
+                "id": current, "session": session, "prompt": None, "start": rec.get("timestamp"),
+                "end": rec.get("timestamp"), "messages": [], "questions": [], "plan": None,
+                "subagents": [], "files": set(), "trigger": None, "trigger_text": None, "root": None,
+            })
+            ts = rec.get("timestamp")
+            if ts:
+                turn["start"] = min(turn["start"] or ts, ts)
+                turn["end"] = max(turn["end"] or ts, ts)
+            if sub:
+                if agent and agent not in turn["subagents"]:
+                    turn["subagents"].append(agent)
+            elif current not in opened:
+                opened.add(current)
+                # A turn starts with a person's prompt, or with the harness handing the
+                # agent a subagent's report or a background-task notice. `root` is the
+                # person's last prompt before it: the decision the chain follows from.
+                kind = (rec.get("origin") or {}).get("kind")
+                if is_prompt(rec) and kind in (None, "human"):
+                    turn["prompt"] = text_of(rec["message"]["content"]).strip()
+                    last_human = current
+                elif rec.get("type") == "user":
+                    o = rec.get("origin") or {}
+                    turn["trigger"] = {"peer": "subagent report", "task-notification": "background task"}.get(kind, kind or "harness")
+                    if o.get("name"):
+                        turn["trigger"] += f" ({o['name']})"
+                    body = o.get("body") or text_of(rec.get("message", {}).get("content")) or ""
+                    # A subagent report arrives behind a fixed harness preamble, indented two spaces.
+                    if "The report follows:" in body:
+                        body = "\n".join(l[2:] if l.startswith("  ") else l for l in body.split("The report follows:", 1)[1].split("\n"))
+                    turn["trigger_text"] = body.strip()[:4000] or None
+                turn["root"] = last_human
+
+            if rec.get("type") == "assistant" and not sub:
+                for c in rec.get("message", {}).get("content") or []:
+                    if not isinstance(c, dict):
+                        continue
+                    if c.get("type") == "text" and c.get("text", "").strip():
+                        turn["messages"].append(c["text"].strip())
+                    elif c.get("type") == "tool_use" and c.get("name") == "AskUserQuestion":
+                        qs = [q.get("question", "") for q in (c.get("input") or {}).get("questions", [])]
+                        asks[c.get("id")] = (current, qs)
+                    elif c.get("type") == "tool_use" and c.get("name") == "ExitPlanMode":
+                        turn["plan"] = (c.get("input") or {}).get("plan")
+
+            if rec.get("type") == "user":
+                for c in rec.get("message", {}).get("content") or [] if isinstance(rec.get("message", {}).get("content"), list) else []:
+                    if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("tool_use_id") in asks:
+                        tid, qs = asks.pop(c["tool_use_id"])
+                        turns[tid]["questions"].append({"questions": qs, "answer": text_of(c.get("content"))})
+
+            result = rec.get("toolUseResult")
+            if not isinstance(result, dict) or rec.get("gitBranch") not in (None, branch):
+                continue
+            plus = lambda hunks: [p for h in hunks or [] for p in pairs(h.get("lines", []))]
+            # Edit/Write/MultiEdit: structuredPatch (empty for a Write that creates a file).
+            if "structuredPatch" in result and result.get("filePath"):
+                if result.get("type") == "create" and not result.get("structuredPatch"):
+                    added = pairs("+" + l for l in (result.get("content") or "").split("\n"))
+                else:
+                    added = plus(result.get("structuredPatch"))
+                edits.append({"file": result["filePath"], "added": added, "turn": current,
+                              "ts": ts or "", "subagent": agent, "via": "edit"})
+            # Bash: Claude Code records the files a command changed as bashEditDiff.
+            for f in (result.get("bashEditDiff") or {}).get("files") or [] if isinstance(result.get("bashEditDiff"), dict) else []:
+                if f.get("filePath"):
+                    edits.append({"file": f["filePath"], "added": plus(f.get("hunks")), "turn": current,
+                                  "ts": ts or "", "subagent": agent, "via": "bash"})
+
+
+# ---------- matching ----------
+
+
+
+def blame(pr_files, edits, turns):
+    pr_paths = set(pr_files)
+    # Edit file -> PR path, by the longest path suffix that is a PR path. Files under
+    # ~/.claude (memory, plans) never belong to a PR.
+    index = {}  # pr path -> {normalized line -> [(ts, turn)]}
+    for e in edits:
+        f = e["file"]
+        if "/.claude/" in f:
+            continue
+        parts = f.split("/")
+        target = next(("/".join(parts[i:]) for i in range(1, len(parts)) if "/".join(parts[i:]) in pr_paths), None)
+        if not target:
+            continue
+        turns[e["turn"]]["files"].add(target)
+        bucket = index.setdefault(target, {})
+        for prev, line in e["added"]:
+            n = norm(line)
+            if n:
+                bucket.setdefault(n, []).append((e["ts"], e["turn"], prev))
+
+    out, stats = {}, {"lines": 0, "traced": 0, "untraced": 0, "trivial": 0,
+                      "generated": 0, "generated_untraced": 0}
+    untraced_by_file = {}
+    for path, lines in pr_files.items():
+        gen = bool(GENERATED.search(path))
+        bucket = index.get(path, {})
+        owners = {}
+        for no, text, hunk, prev in lines:
+            n = norm(text)
+            if not n or TRIVIAL.match(n):
+                owners[no] = ("trivial", hunk)
+                continue
+            hits = bucket.get(n)
+            # A common line can be added by many turns; the one that added it after the
+            # same neighbour is the one that wrote this occurrence.
+            if hits:
+                hits = [h for h in hits if h[2] == prev] or hits
+                order = []
+                for _, t, _ in sorted(hits, reverse=True):
+                    if t not in order:
+                        order.append(t)
+                owners[no] = (order, hunk)
+            else:
+                owners[no] = (None, hunk)
+        # Trivial lines take the owner of the nearest traced line in the same hunk.
+        nos = sorted(owners)
+        before, after = [None] * len(nos), [None] * len(nos)
+        last = None
+        for i, no in enumerate(nos):
+            o = owners[no]
+            if last and last[1] != o[1]:
+                last = None
+            if isinstance(o[0], list):
+                last = (i, o[1], o[0])
+            before[i] = last
+        last = None
+        for i in range(len(nos) - 1, -1, -1):
+            o = owners[nos[i]]
+            if last and last[1] != o[1]:
+                last = None
+            if isinstance(o[0], list):
+                last = (i, o[1], o[0])
+            after[i] = last
+        for i, no in enumerate(nos):
+            if owners[no][0] != "trivial":
+                continue
+            near = [x for x in (before[i], after[i]) if x]
+            if near:
+                owners[no] = ("trivial", owners[no][1], min(near, key=lambda x: abs(x[0] - i))[2])
+        rec = {}
+        for no in nos:
+            o = owners[no]
+            stats["lines"] += 1
+            if gen:
+                stats["generated"] += 1
+            if o[0] == "trivial":
+                stats["trivial"] += 1
+                if len(o) == 3:
+                    rec[str(no)] = o[2][:1]
+                continue
+            if isinstance(o[0], list):
+                stats["traced"] += 1
+                rec[str(no)] = o[0]
+            else:
+                stats["untraced"] += 1
+                if gen:
+                    stats["generated_untraced"] += 1
+                untraced_by_file[path] = untraced_by_file.get(path, 0) + 1
+        out[path] = rec
+    return out, stats, untraced_by_file
+
+
+# ---------- main ----------
+
+def build(repo, number):
+    pr = json.loads(gh("pr", "view", str(number), "--repo", repo, "--json", "headRefName,headRefOid,title"))
+    branch = pr["headRefName"]
+    paths = transcript_files(repo, branch)
+    key = {"v": CACHE_VERSION, "head": pr["headRefOid"],
+           "files": {p: os.path.getmtime(p) for p in paths if os.path.exists(p)}}
+    return pr, branch, paths, key
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("repo")
+    ap.add_argument("number", type=int)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-cache", action="store_true")
+    a = ap.parse_args()
+
+    pr, branch, paths, key = build(a.repo, a.number)
+    cache = CACHE / f"{a.repo.replace('/', '-')}-{a.number}.json"
+    doc = None
+    if not a.no_cache:
+        try:
+            got = json.loads(cache.read_text())
+            if got.get("key") == key:
+                doc = got
+        except (OSError, ValueError):
+            pass
+    if doc is None:
+        pr_files = added_lines(gh("pr", "diff", str(a.number), "--repo", a.repo))
+        turns, edits = {}, []
+        for p in paths:
+            read_transcript(p, branch, turns, edits)
+        files, stats, untraced = blame(pr_files, edits, turns)
+        used = {t for lines in files.values() for owners in lines.values() for t in owners}
+        used |= {turns[t]["root"] for t in used if turns[t].get("root") in turns}
+        ordered = sorted((turns[t] for t in used), key=lambda t: t["start"] or "")
+        for i, t in enumerate(ordered, 1):
+            t["n"] = i
+            t["files"] = sorted(t["files"])
+        doc = {"key": key, "repo": a.repo, "number": a.number, "branch": branch, "title": pr["title"],
+               "sessions": sorted({Path(p).stem if "/subagents/" not in p else p.split("/subagents/")[0].rsplit("/", 1)[1] for p in paths}),
+               "edits": len(edits), "turns": {t["id"]: t for t in ordered}, "files": files, "stats": stats,
+               "untraced_by_file": dict(sorted(untraced.items(), key=lambda kv: -kv[1]))}
+        CACHE.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CACHE, suffix=".tmp")
+        with os.fdopen(fd, "w") as fh:
+            json.dump(doc, fh)
+        os.replace(tmp, cache)
+
+    if a.json:
+        json.dump({k: v for k, v in doc.items() if k != "key"}, sys.stdout)
+        return
+    s = doc["stats"]
+    real = s["traced"] + s["untraced"]
+    pct = lambda x, y: f"{100 * x / y:.0f}%" if y else "n/a"
+    print(f"{a.repo}#{a.number} {branch}")
+    print(f"  sessions {len(doc['sessions'])}, edits {doc['edits']}, turns that own lines {len(doc['turns'])}")
+    print(f"  added lines {s['lines']}: traced {s['traced']}, untraced {s['untraced']}, trivial {s['trivial']}")
+    print(f"  untraced share {pct(s['untraced'], real)} of non-trivial lines; "
+          f"{pct(s['untraced'] - s['generated_untraced'], real - s['generated_untraced'])} excluding generated files")
+    print("  most untraced:")
+    for path, n in list(doc["untraced_by_file"].items())[:8]:
+        print(f"    {n:6d}  {path}")
+
+
+if __name__ == "__main__":
+    main()

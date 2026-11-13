@@ -1,0 +1,17 @@
+{
+  "seats": [
+    {
+      "name": "Standup",
+      "space": "Standup",
+      "folder": "~",
+      "argv": ["claude"],
+      "command": { "send": "/standup", "label": "Run /standup" }
+    },
+    {
+      "name": "General",
+      "space": "General",
+      "folder": "~",
+      "action": "board-strip.scratch"
+    }
+  ]
+}
