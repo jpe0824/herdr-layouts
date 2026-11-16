@@ -5,6 +5,8 @@ panel. A **termchat** button in the tab bar shows how many messages are unread a
 live termchat session beside your terminals. Herdr's own alerts, including termchat's, also
 reach macOS as system notifications while the Herdr window is in the background.
 
+![Herdr + Termchat](preview.png)
+
 ## What you see
 
 Herdr's shipped `main` layout, unchanged except for:
