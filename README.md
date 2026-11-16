@@ -7,6 +7,7 @@ like a Herdr home (`layouts/`, `mods/`, `keys.json`), with a `RECIPE.md` brief a
 | Layout | What it is |
 |---|---|
 | [kanbandrawer](kanbandrawer/) | A kanban board of git worktrees in a bottom drawer, with live Claude sessions on each card, a Stage column for the issue, plan and PR, and Reviews / Projects panels. |
+| [termchat](termchat/) | Herdr + Termchat: Herdr's default layout with termchat in the right panel, an unread count on its tab-bar button, and Herdr alerts sent on to macOS notifications. |
 
 ## Installing one
 
