@@ -68,3 +68,24 @@ Mods:
   terminal and block upkeep) and `panelwidth.js` (per-view widths).
 - `system-toast`: Herdr's shipped `toast`, plus the macOS notification. Title and body reach
   `osascript` only as arguments, never inside the script text.
+
+## Watch out
+
+- **A program exiting deletes its block.** Herdr closes a pane whose program exits and
+  removes that block from the layout, panel blocks included. Run termchat in a loop in the
+  terminal, and re-add the block (`layout.set`) when it is missing.
+- **Start the terminal from the app, not from an agent's terminal.** `hc run` inside an agent's
+  terminal records that agent as the parent; the new terminal then dies with it
+  (`die_with_parent`) and sends it notes. The mod's `exec("hc", ...)` has no parent.
+- **Blocks resolve terminals by name.** `{ "terminal": "termchat" }` follows whichever live
+  terminal holds that name, so a restarted terminal shows in the same place.
+- **The conversation open in the panel stays read.** termchat marks the open conversation read
+  even while the panel is hidden, so it never counts toward the badge (tracked in
+  jpe0824/termchat#15).
+- **Polling starts termchat's background process.** `termchat chats` starts it when it is not
+  running, every 5 s.
+- **`herdr-app check` posts a notification.** The check runs `system-toast` with the window
+  inactive, so `osascript` really posts one.
+- **macOS lists the notifications under Script Editor**, since `osascript` posts them.
+- **Herdr alerts come only from OSC 7501.** OSC 9, 99 and 777 make an in-app notice at most;
+  none reached macOS while the window was in the background.
